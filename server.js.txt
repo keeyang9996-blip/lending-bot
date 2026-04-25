@@ -1,0 +1,228 @@
+require("dotenv").config();
+const express = require("express");
+const axios = require("axios");
+
+const app = express();
+app.use(express.json());
+
+const PORT = process.env.PORT || 3000;
+const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
+const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
+const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
+const ADMIN_PHONE = process.env.ADMIN_PHONE;
+
+const users = {};
+
+// Verify webhook
+app.get("/webhook", (req, res) => {
+  const mode = req.query["hub.mode"];
+  const token = req.query["hub.verify_token"];
+  const challenge = req.query["hub.challenge"];
+
+  if (mode === "subscribe" && token === VERIFY_TOKEN) {
+    return res.status(200).send(challenge);
+  }
+
+  res.sendStatus(403);
+});
+
+// Receive WhatsApp messages
+app.post("/webhook", async (req, res) => {
+  try {
+    const message =
+      req.body.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
+
+    if (message) {
+      const from = message.from;
+      const text = message.text?.body?.trim();
+
+      if (text) {
+        await handleMessage(from, text);
+      }
+    }
+
+    res.sendStatus(200);
+  } catch (error) {
+    console.error("Webhook error:", error.message);
+    res.sendStatus(500);
+  }
+});
+
+async function handleMessage(phone, text) {
+  if (!users[phone]) {
+    users[phone] = {
+      step: "welcome",
+      income: null,
+      job: null,
+      epf: null,
+      ctos: null,
+      urgent: null
+    };
+  }
+
+  const user = users[phone];
+
+  if (text.toLowerCase() === "restart") {
+    users[phone] = {
+      step: "welcome",
+      income: null,
+      job: null,
+      epf: null,
+      ctos: null,
+      urgent: null
+    };
+
+    return sendMessage(phone, welcomeMessage());
+  }
+
+  if (user.step === "welcome") {
+    user.step = "income";
+    return sendMessage(phone, welcomeMessage());
+  }
+
+  if (text === "1" || text === "2" || text === "3") {
+    user.step = "income";
+    return sendMessage(phone, "好的 👍 请问你的月收入是多少？例如：3000");
+  }
+
+  if (user.step === "income") {
+    user.income = Number(text.replace(/\D/g, ""));
+    user.step = "job";
+    return sendMessage(phone, "你的工作类型是？\n\n1️⃣ Full time\n2️⃣ Self-employed\n3️⃣ 没有工作");
+  }
+
+  if (user.step === "job") {
+    if (text === "1") user.job = "full_time";
+    else if (text === "2") user.job = "self_employed";
+    else user.job = "none";
+
+    user.step = "epf";
+    return sendMessage(phone, "你有 EPF 吗？\n\n1️⃣ Yes\n2️⃣ No");
+  }
+
+  if (user.step === "epf") {
+    user.epf = text === "1" ? "yes" : "no";
+    user.step = "ctos";
+    return sendMessage(phone, "你的 CTOS / CCRIS 情况？\n\n1️⃣ Clean\n2️⃣ 有问题\n3️⃣ 不知道");
+  }
+
+  if (user.step === "ctos") {
+    if (text === "1") user.ctos = "clean";
+    else if (text === "2") user.ctos = "problem";
+    else user.ctos = "unknown";
+
+    user.step = "urgent";
+    return sendMessage(phone, "你急需要 loan 吗？\n\n1️⃣ Yes\n2️⃣ No");
+  }
+
+  if (user.step === "urgent") {
+    user.urgent = text === "1" ? "yes" : "no";
+
+    const result = scoreLead(user);
+    user.status = result.status;
+    user.score = result.score;
+    user.step = "done";
+
+    await sendMessage(phone, result.reply);
+
+    if (result.status === "LP-HOT") {
+      await notifyAdmin(phone, user);
+    }
+
+    return;
+  }
+
+  if (user.step === "done") {
+    return sendMessage(
+      phone,
+      "我们已经收到你的资料 ✅\n\n顾问会尽快跟进你。\n\n如果要重新填写，请回复：restart"
+    );
+  }
+}
+
+function scoreLead(data) {
+  let score = 0;
+
+  if (data.income >= 2500) score += 30;
+  if (data.job === "full_time") score += 25;
+  if (data.job === "self_employed") score += 15;
+  if (data.epf === "yes") score += 20;
+  if (data.ctos === "clean") score += 20;
+  if (data.ctos === "unknown") score += 10;
+  if (data.urgent === "yes") score += 10;
+
+  if (score >= 80) {
+    return {
+      score,
+      status: "LP-HOT",
+      reply:
+        "🎉 好消息！你的条件有很高机会可以继续处理。\n\n请准备：\n📌 Full Name\n📌 Loan Amount\n📌 Preferred Time\n\n顾问会优先跟进你。"
+    };
+  }
+
+  if (score >= 50) {
+    return {
+      score,
+      status: "LP-WARM",
+      reply:
+        "👌 你的情况可以尝试。\n\n我们建议先让顾问帮你检查资料，提高通过机会。\n\n请回复 YES 安排顾问跟进。"
+    };
+  }
+
+  return {
+    score,
+    status: "LP-COLD",
+    reply:
+      "感谢你的资料 🙏\n\n目前不建议马上申请，因为可能会影响记录。\n\n我们可以先教你如何提升资格。"
+  };
+}
+
+function welcomeMessage() {
+  return (
+    "Hi 👋 欢迎来到 Lending Plus\n\n" +
+    "我们可以帮你免费 check loan eligibility。\n\n" +
+    "请选择：\n" +
+    "1️⃣ Check eligibility\n" +
+    "2️⃣ Apply loan\n" +
+    "3️⃣ Loan rejected before"
+  );
+}
+
+async function sendMessage(to, text) {
+  await axios.post(
+    `https://graph.facebook.com/v19.0/${PHONE_NUMBER_ID}/messages`,
+    {
+      messaging_product: "whatsapp",
+      to,
+      text: {
+        body: text
+      }
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${WHATSAPP_TOKEN}`,
+        "Content-Type": "application/json"
+      }
+    }
+  );
+}
+
+async function notifyAdmin(customerPhone, data) {
+  const adminMessage =
+    "🔥 NEW HOT LEAD\n\n" +
+    `Phone: ${customerPhone}\n` +
+    `Income: RM${data.income}\n` +
+    `Job: ${data.job}\n` +
+    `EPF: ${data.epf}\n` +
+    `CTOS: ${data.ctos}\n` +
+    `Urgent: ${data.urgent}\n` +
+    `Score: ${data.score}\n` +
+    `Status: ${data.status}\n\n` +
+    "Action: Follow up now.";
+
+  await sendMessage(ADMIN_PHONE, adminMessage);
+}
+
+app.listen(PORT, () => {
+  console.log(`Lending Plus bot running on port ${PORT}`);
+});
